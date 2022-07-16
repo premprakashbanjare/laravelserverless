@@ -1,0 +1,112 @@
+name: Deploy
+env:
+  ORG: rdokos
+  NAME: serverless-laravel
+  BASE_DOMAIN_NAME: rdok.co.uk
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  BASE_DOMAIN_ROUTE_53_HOSTED_ZONE_ID: ${{ secrets.BASE_DOMAIN_ROUTE_53_HOSTED_ZONE_ID }}
+  BASE_DOMAIN_WILD_CARD_CERTIFICATE_ARN: ${{ secrets.BASE_DOMAIN_WILD_CARD_CERTIFICATE_ARN }}
+  AWS_DEFAULT_REGION: 'eu-west-1' # Required to solve issue with Python AWS https://github.com/aws/aws-cli/issues/5262
+  APP_KEY: ${{ secrets.APP_KEY }} # Generate using `php artisan key:generate --show`
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        required: false
+        description: "Allowed values: prod, test"
+        default: prod
+jobs:
+  check:
+    uses: rdok/serverless-laravel/.github/workflows/check.yml@main
+  deploy:
+    name: Deploy
+    needs: [check]
+    environment:
+      name: ${{ github.event.inputs.environment == '' && 'test' || github.event.inputs.environment }}
+    concurrency: ${{ github.event.inputs.environment == '' && 'test' || github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Prepare environment variables
+        id: env
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+        run: |
+          [ "$ENVIRONMENT" = "" ] && ENVIRONMENT=test
+
+          if [ "$ENVIRONMENT" == "test" ]; then
+            echo ::set-output name=domain-name::"${NAME}-test.${BASE_DOMAIN_NAME}"
+          elif [ "$ENVIRONMENT" == "prod" ]; then
+            echo ::set-output name=domain-name::"${NAME}.${BASE_DOMAIN_NAME}"
+          else
+            printf '%s\n' "ENVIRONMENT is not in accepted range: test, prod." >&2
+            exit 1
+          fi
+
+          echo ::set-output name=stack-laravel-name::"${ORG}-${ENVIRONMENT}-${NAME}"
+          echo ::set-output name=stack-certificate-name::"${ORG}-${ENVIRONMENT}-${NAME}-certificate"
+          echo ::set-output name=cicd-bucket-certificate::"${ORG}-${ENVIRONMENT}-cicd-us-east-1"
+          echo ::set-output name=cicd-bucket-laravel::"${ORG}-${ENVIRONMENT}-cicd-eu-west-1"
+      - name: Build Laravel
+        run: |
+          make config-clear
+          make composer-prod
+      - name: Build Static
+        run: |
+          cd laravel
+          npm install
+          npm run prod
+      - name: Deploy domain certificate
+        run: |
+          sam deploy \
+            --template-file template-certificate.yml \
+            --region "us-east-1" \
+            --s3-bucket "${{ steps.env.outputs.cicd-bucket-certificate }}" \
+            --s3-prefix "${NAME}" \
+            --stack-name "${{ steps.env.outputs.stack-certificate-name }}" \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset \
+            --no-confirm-changeset \
+            --parameter-overrides \
+              DomainName="${{ steps.env.outputs.domain-name }}" \
+              BaseDomainRoute53HostedZoneId="${BASE_DOMAIN_ROUTE_53_HOSTED_ZONE_ID}"
+      - name: Deploy Laravel
+        run: |
+          CERTIFICATE_ARN=$(aws cloudformation describe-stacks  \
+            --region 'us-east-1' \
+            --stack-name "${{ steps.env.outputs.stack-certificate-name }}" \
+            --query 'Stacks[0].Outputs[?OutputKey==`CertificateARN`].OutputValue' \
+            --output text)
+          sam deploy \
+            --region "eu-west-1" \
+            --s3-bucket "${{ steps.env.outputs.cicd-bucket-laravel }}" \
+            --s3-prefix "${NAME}" \
+            --stack-name "${{ steps.env.outputs.stack-laravel-name }}" \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset \
+            --no-confirm-changeset \
+            --parameter-overrides \
+              CertificateARN="${CERTIFICATE_ARN}" \
+              AppKey="${APP_KEY}" \
+              DomainName="${{ steps.env.outputs.domain-name }}" \
+              WildcardCertificateARN="${BASE_DOMAIN_WILD_CARD_CERTIFICATE_ARN}" \
+              BaseDomainRoute53HostedZoneId="${BASE_DOMAIN_ROUTE_53_HOSTED_ZONE_ID}"
+      - name: Deploy Static
+        run: |
+          ASSETS_BUCKET=$(aws cloudformation describe-stacks  \
+            --region "eu-west-1" \
+            --stack-name "${{ steps.env.outputs.stack-laravel-name }}" \
+            --query 'Stacks[0].Outputs[?OutputKey==`AssetsBucketName`].OutputValue' \
+            --output text)
+          aws s3 sync ${GITHUB_WORKSPACE}/laravel/public s3://${ASSETS_BUCKET}/assets --delete
+      - name: Deploy Storage showcase file
+        run: |
+          STORAGE_BUCKET=$(aws cloudformation describe-stacks  \
+            --region "eu-west-1" \
+            --stack-name "${{ steps.env.outputs.stack-laravel-name }}" \
+            --query 'Stacks[0].Outputs[?OutputKey==`StorageBucketName`].OutputValue' \
+            --output text)
+          aws s3 cp ${GITHUB_WORKSPACE}/laravel/storage/app/showcase-storage-retrieval.jpg s3://${STORAGE_BUCKET}
